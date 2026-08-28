@@ -1,0 +1,87 @@
+name: GEFS night (3h in-night sampling)
+
+# 밤 안 3시간 간격 + 변수 확장 수집 (2026-08-28).
+#   · worker_night.py 가 data/night/ 에 쓴다 — worker_v2 의 data/v2 와 안 섞인다
+#   · 멤버 5 · 격자 점 1개 (사용자 지시). 늘리는 것은 밤 시각과 변수뿐
+#   · 재개형: 이미 받은 (cycle, lead) 는 건너뛴다 → 그냥 다시 돌리면 이어서 받는다
+#
+# 레인 = 멤버 5 × 기간 5분할 = 25 job. GitHub 무료 동시 상한이 20이다.
+#
+# ★ 2레인 분담 (2026-08-29) — 개인계정 + 본인 소유 Organization
+#   (무료 개인계정은 1인 1개가 약관이라 두 번째 개인계정 대신 조직을 쓴다)
+#     계정 A  Diu1773/kmtnet-gefs-collector       멤버 0~4
+#     레인 B  pmj-seeing-lab/kmtnet-gefs-b        멤버 5~9  ← **이 저장소**
+#   동시 실행 상한이 **계정마다** 20이라 둘을 합치면 40레인이 된다.
+#   파일 이름이 `2021_m5.jsonl.gz` 처럼 멤버로 갈려 **섞여도 충돌이 없다.**
+#
+# ★ 기간을 2018-01-01 로 늘렸다 — KMTNet 시잉이 2018 부터 있기 때문이다
+#   (아카이브 확인: 2015·2016·2017 은 FWHM 링크가 0개).
+# 한 세션 5시간(=BUDGET_MIN 300) 뒤 스스로 커밋하고 끝난다. cron 이 다시 띄운다.
+#
+# ⚠ 멤버 0 만 atmos.25 를 추가로 받는다(worker_night.py fetch_unit).
+#    멤버 1~30 은 산출물 2개라 작업당 비용이 2/3 다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_min:
+        description: "세션 예산 (분). GitHub job 상한 6시간이라 300 권장"
+        default: "300"
+      workers:
+        description: "동시 다운로드 스레드"
+        # ⚠ 10 으로 올려 봤지만 **안 빨라졌다** (2026-08-29 실측).
+        #    워커 6 = 836~991 작업/시간 · 워커 10 = 657~1025 (평균은 오히려 낮다).
+        #    GitHub 러너가 4 vCPU 라 6 에서 이미 포화다. 6 으로 되돌린다.
+        default: "6"
+  schedule:
+    - cron: "10 */6 * * *"        # 6시간마다 재개
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gefs-night
+  cancel-in-progress: false
+
+jobs:
+  night:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        member: [5, 6, 7, 8, 9]        # ★ 이 저장소 몫. 멤버 0~4 는 계정 A 가 받는다
+        span:
+          - { start: "2018-01-01", end: "2019-05-31" }
+          - { start: "2019-06-01", end: "2020-10-31" }
+          - { start: "2020-11-01", end: "2022-03-31" }
+          - { start: "2022-04-01", end: "2024-05-31" }
+          - { start: "2024-06-01", end: "2026-08-14" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 얕은 클론이면 rebase 가 깨진다 (v2 수집에서 데인 것)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install --quiet herbie-data pandas numpy
+      - name: Git identity
+        run: |
+          git config user.name "gefs-collector-bot"
+          git config user.email "actions@users.noreply.github.com"
+      - name: Collect
+        env:
+          MEMBER: ${{ matrix.member }}
+          START: ${{ matrix.span.start }}
+          END: ${{ matrix.span.end }}
+          WORKERS: ${{ inputs.workers || '6' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '300' }}
+          # 솎지 않는다. 멤버를 10개로 줄이고 **날짜를 전부** 받는 쪽을 골랐다
+          # (사용자 지시 2026-08-29: 「10멤버씩 나눠서 받는 게 테스팅도 쉽고 빨리 찬다」).
+          # 얇게 31멤버보다 두껍게 10멤버가 분위수·리드·계절 분석에 쓸 수 있다.
+          STRIDE: "1"
+          COMMIT_EVERY: "40"
+          BRANCH: master
+        run: python -u worker_night.py
