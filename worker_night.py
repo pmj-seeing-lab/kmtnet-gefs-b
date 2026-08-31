@@ -68,7 +68,7 @@ LEVELS = sorted(LEV_A + LEV_B)                       # 31층 (v2 와 같은 순�
 
 # 사이트별 밤 UT 시각 (3시간 배수 4개). era5_features.night_hours 실측에서 뽑음.
 NIGHT_H = {"ctio": [0, 3, 6, 9], "saao": [18, 21, 0, 3], "sso": [9, 12, 15, 18]}
-DAYS = list(range(1, 8))                             # 리드 1~7일
+NDS = list(range(0, 7))     # 밤번호 0~6 (0 = 발행일 저녁의 첫 밤)
 
 
 # ★★ GEFS 는 2020-09-24 사이클부터 **3시간 간격**이고, 그 전에는 **6시간 간격**이다.
@@ -87,16 +87,39 @@ DAYS = list(range(1, 8))                             # 리드 1~7일
 V12_3H_FROM = "2020-09-24"
 
 
+def _night_offset(site, h):
+    """h UT(그 날)가 **그 날 밤이면 0, 전날 밤이면 −1** — 경도로 직접 계산한다.
+
+    ★ 2026-09-01 수정. 옛 공식은 `h < 12 → 다음 날 밤`이라는 **근사**였는데,
+      밤 판정의 정본(`sites.night_key`)은 경도를 쓴다. 두 벌이 SSO 9 UT 에서 갈렸다 —
+      SSO 는 UT+9.94h 라 9 UT 가 **같은 저녁**(현지 19시)인데 근사는 다음 날 밤으로
+      보냈다. 그래서 SSO 밤번호 0 이 세 시각뿐이었고 (`--min-h 4` 에 전부 탈락)
+      **가장 짧은 리드(f9~f18)를 통째로 못 쓰고 있었다** (audit_night_plan.py ② 실측:
+      SSO nd0 커버율 0.0%, CTIO·SAAO 는 49.5·47.6%).
+
+    식: night_key = floor(t_local − 12h) 이므로,
+        offset = floor((h + lon/15 − 12) / 24)   (일 단위, 0 또는 −1)"""
+    lo = SITES[site][1]
+    lon = lo if lo <= 180 else lo - 360          # 0~360 → −180~180
+    import math
+    return math.floor((h + lon / 15.0 - 12.0) / 24.0)
+
+
 def needed_leads(cycle=None):
     """4사이트 합집합 리드. 파일 하나로 4곳을 다 뽑으므로 합집합만 받으면 된다.
 
+    사이트·시각마다 `밤번호 nd 의 리드 = 24·(nd − offset) + h` 로 계산한다.
+    옛 근사와의 차이는 **리드 9 하나가 늘어난 것**뿐이다 (SSO 밤번호 0 의 9 UT).
+    나머지 55개는 그대로다 — `--check` 가 이를 검증한다.
+
     `cycle` 을 주면 **그 날에 실제로 존재하는 리드만** 돌려준다 —
-    2020-09-24 이전은 6시간 간격뿐이므로 6의 배수만 남긴다."""
+    2020-09-24 이전은 6시간 간격뿐이므로 6의 배수만 남긴다 (리드 9 도 그때는 없다)."""
     L = set()
-    for hs in NIGHT_H.values():
-        for k in DAYS:
-            for h in hs:
-                lead = 24 * k + h if h < 12 else 24 * (k - 1) + h
+    for site, hs in NIGHT_H.items():
+        for h in hs:
+            off = _night_offset(site, h)
+            for nd in NDS:
+                lead = 24 * (nd - off) + h
                 if 0 < lead <= 192:
                     L.add(lead)
     if cycle is not None and str(cycle)[:10] < V12_3H_FROM:
@@ -378,5 +401,24 @@ if __name__ == "__main__":
         cyc = len(pd.date_range("2021-04-01", "2026-08-14", freq="D"))
         print(f"리드 {len(L)}개: {L}")
         print(f"사이클 {cyc:,} · 멤버 5 → 작업 {len(L)*cyc*5:,}")
+    elif "--check" in sys.argv:
+        # 리드 계산 자가검증 — 옛 근사와의 차이가 정확히 {9} 인지, v11 필터가 그대로인지
+        old = set()
+        for hs in NIGHT_H.values():
+            for k in range(1, 8):
+                for h in hs:
+                    ld = 24 * k + h if h < 12 else 24 * (k - 1) + h
+                    if 0 < ld <= 192:
+                        old.add(ld)
+        new = set(needed_leads())
+        new_v11 = set(needed_leads("2018-06-01"))
+        old_v11 = {x for x in old if x % 6 == 0}
+        print(f"v12: 옛 {len(old)} → 새 {len(new)} · 더해진 것 {sorted(new-old)} · "
+              f"빠진 것 {sorted(old-new)}")
+        print(f"v11: 옛 {len(old_v11)} → 새 {len(new_v11)} · "
+              f"차이 {sorted(new_v11 ^ old_v11)}")
+        assert new - old == {9} and not (old - new), "v12 차이가 {9} 가 아니다"
+        assert new_v11 == old_v11, "v11 리드가 달라졌다"
+        print("검증 통과 — 더해진 것은 리드 9 하나뿐이다")
     else:
         main()
