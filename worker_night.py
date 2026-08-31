@@ -71,8 +71,27 @@ NIGHT_H = {"ctio": [0, 3, 6, 9], "saao": [18, 21, 0, 3], "sso": [9, 12, 15, 18]}
 DAYS = list(range(1, 8))                             # 리드 1~7일
 
 
-def needed_leads():
-    """4사이트 합집합 리드. 파일 하나로 4곳을 다 뽑으므로 합집합만 받으면 된다."""
+# ★★ GEFS 는 2020-09-24 사이클부터 **3시간 간격**이고, 그 전에는 **6시간 간격**이다.
+#   (v12 운영 전환 2020-09-23. 자료에서 확인한 첫 3시간 간격 사이클이 2020-09-24 다.)
+#
+#   2026-09-01 에 이것 때문에 이 저장소의 잡이 죽어 있었다. `needed_leads()` 가 날짜와
+#   무관하게 56개를 내놓아, 2018~2020-02 구간 잡들이 **존재하지 않는 리드(15·21·27···)**
+#   를 5시간 동안 두드렸다. m5·m8 의 그 구간이 `ok 0 fail 5,617` / `ok 0 fail 6,195`
+#   (각 301분)였고, 로그가 17KB 였다(정상 잡은 37MB — herbie GRIB 출력이 아예 없었다).
+#   계정 A 에서 같은 증상의 커밋 메시지에 이유가 찍혔다 —
+#       `ValueError: No index file was found for None` x3,444 · `KeyError: 'href'` x567
+#
+#   창고에서 센 근거: v11 시기 리드는 **28개, 전부 6의 배수**(12·18···174),
+#   v12 시기는 **56개**(12·15···177). `gefs_night` 과 `gefs_v2` 가 독립적으로 같은
+#   경계(2020-09-24)를 가리킨다.
+V12_3H_FROM = "2020-09-24"
+
+
+def needed_leads(cycle=None):
+    """4사이트 합집합 리드. 파일 하나로 4곳을 다 뽑으므로 합집합만 받으면 된다.
+
+    `cycle` 을 주면 **그 날에 실제로 존재하는 리드만** 돌려준다 —
+    2020-09-24 이전은 6시간 간격뿐이므로 6의 배수만 남긴다."""
     L = set()
     for hs in NIGHT_H.values():
         for k in DAYS:
@@ -80,6 +99,8 @@ def needed_leads():
                 lead = 24 * k + h if h < 12 else 24 * (k - 1) + h
                 if 0 < lead <= 192:
                     L.add(lead)
+    if cycle is not None and str(cycle)[:10] < V12_3H_FROM:
+        L = {x for x in L if x % 6 == 0}
     return sorted(L)
 
 
@@ -268,7 +289,6 @@ def main():
     BUDGET = float(os.environ.get("BUDGET_MIN", "300")) * 60      # 세션 예산(초)
     COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "40"))
 
-    leads = needed_leads()
     # STRIDE · 발행일을 몇 일마다 받을지. 1 이면 매일.
     #   멤버 5~30 은 「앙상블 멤버를 늘리는 것이 값어치가 있나」를 재려고 받는 것이지
     #   그 자체가 최종 자료가 아니다. 날짜를 솎으면 그 질문에 훨씬 빨리 답할 수 있고,
@@ -281,8 +301,14 @@ def main():
         cyc = cyc[((cyc - pd.Timestamp("2021-04-01")).days % STRIDE) == 0]
     cycles = [c.strftime("%Y-%m-%d %H:%M") for c in cyc]
     seen = done_keys(M)
-    todo = [(c, f) for c in cycles for f in leads if (c, f) not in seen]
-    print(f"[m{M}] 리드 {len(leads)}개 · 사이클 {len(cycles):,} · "
+    # ★ 리드를 **사이클마다** 고른다 — 2020-09-24 이전은 6시간 간격뿐이다.
+    #   이 줄이 예전에는 `for f in leads`(고정 56개)였고, 그래서 옛 구간 잡이
+    #   없는 파일을 두드리며 5시간을 태웠다 (m5·m8 성공 0건).
+    todo = [(c, f) for c in cycles for f in needed_leads(c) if (c, f) not in seen]
+    n_lead_lo = len(needed_leads("2018-01-01"))
+    n_lead_hi = len(needed_leads("2024-01-01"))
+    print(f"[m{M}] 리드 {n_lead_lo}개(2020-09-24 이전) / {n_lead_hi}개(이후) · "
+          f"사이클 {len(cycles):,} · "
           f"할 일 {len(todo):,} (이미 {len(seen):,}) · 워커 {WORKERS}", flush=True)
     if not todo:
         print("할 일 없음"); return
