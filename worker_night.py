@@ -169,6 +169,13 @@ def _iter(d):
             yield var, lev, sv
 
 
+FAILWHY = {}   # 실패 이유별 횟수 — 커밋 메시지에 실어 보낸다
+#  ★ 2026-09-01: 계정 A 에만 있던 계측을 이 저장소로 옮겼다.
+#    A 는 커밋 메시지에 `| throttle(503/429) x6` 이 찍혀 왜 느린지 보이는데, B 는
+#    `ok / fail` 만 찍혀서 **느린 이유를 볼 방법이 없었다.** B 의 잡당 속도가
+#    A 의 2/3(중앙 590/h vs 900/h)인 것을 확인했는데 원인을 좁힐 자료가 없다.
+
+
 def fetch_unit(cycle, fxx, member, retry=2):
     from herbie import Herbie
     for k in range(retry + 1):
@@ -200,10 +207,15 @@ def fetch_unit(cycle, fxx, member, retry=2):
         except Exception as e:
             s = str(e)
             if "Slow Down" in s or "503" in s or "429" in s:
+                FAILWHY["throttle(503/429)"] = FAILWHY.get("throttle(503/429)", 0) + 1
                 time.sleep(10 * (k + 1)); continue
             if k >= retry:
+                # ⚠ **이유를 남긴다.** 그냥 None 을 돌려주면 무엇이 문제인지 못 좁힌다.
+                key = f"{type(e).__name__}: {s[:60]}"
+                FAILWHY[key] = FAILWHY.get(key, 0) + 1
                 return None
             time.sleep(4)
+    FAILWHY["throttle 재시도 소진"] = FAILWHY.get("throttle 재시도 소진", 0) + 1
     return None
 
 
@@ -315,7 +327,11 @@ def main():
                 buf.clear()
                 el = time.time() - t0
                 rate = ok / el * 3600 if el else 0
-                commit_push(f"night m{M} ok {ok} fail {fail} ({rate:.0f}/h)")
+                why = ""
+                if FAILWHY:
+                    top = sorted(FAILWHY.items(), key=lambda kv: -kv[1])[:2]
+                    why = " | " + " · ".join(f"{k} x{v}" for k, v in top)
+                commit_push(f"night m{M} ok {ok} fail {fail} ({rate:.0f}/h){why}")
                 print(f"  ok {ok:,} fail {fail} · {el/60:.1f}분 · {rate:.0f}작업/시간", flush=True)
                 purge_cache()
     for yr, rows in buf.items():
