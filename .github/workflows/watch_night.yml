@@ -1,0 +1,90 @@
+# GEFS night 수집 자체 감시 (2026-09-01 신설)
+#
+# 왜 — 2026-09-01 에 세 가지가 **초록불 뒤에** 숨어 있었다.
+#   ① 잡이 17+3 두 물결로 갈려 평균 동시성이 절반이었다
+#   ② 구간 경계가 연도 중간을 지나 두 잡이 같은 파일에 append 했다 (FAILURES F-200)
+#   ③ 어떤 멤버는 5시간 동안 성공 0건이었다 (`ok 0 fail 5,617`)
+# 셋 다 종료코드 0 이었다. 사람이 2~3시간마다 봐야 보이는 상태였고 지속되지 않는다.
+#
+# 알림 — **메일이 아니다.** 사용자 지적: 「메일이면 내가 너한테 다시 보내 줘야하잖어」.
+#   판정을 `_watchdog/status.md` 로 **레포에 커밋**한다. 사람이 중계하지 않아도
+#   에이전트가 `gh api repos/{owner}/{repo}/contents/_watchdog/status.md` 로 바로 읽는다.
+#
+# 비용 — 이 저장소는 공개라 Actions 시간이 무제한이고, 아래는 **자료 파일을 안 받는다**
+#   (sparse checkout 으로 `.github` + `_watchdog` 만 = 수십 KB). 한 회당 1분 미만.
+
+name: GEFS night watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "35 */3 * * *"      # 3시간마다. night cron(:10) 과 겹치지 않게 :35
+
+permissions:
+  contents: write               # 상태 파일 커밋
+  actions: read                 # 잡 시작시각을 보려면 필요하다
+
+concurrency:
+  group: gefs-night-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # ★ 자료(`data/`)를 받지 않는다. 이 저장소는 1 GB 라 전체 체크아웃은 낭비다.
+      #   감시가 보는 것은 커밋 메시지·Actions API·워크플로 파일뿐이다.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 500      # 최근 커밋 메시지를 세려면 얕은 클론이면 안 된다
+          sparse-checkout: |
+            .github
+            _watchdog
+            watchdog_night.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Git identity
+        run: |
+          git config user.name "gefs-watchdog-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+      # 판정은 실패해도 커밋까지는 가야 한다 — 그래서 여기서 종료코드를 삼키고
+      # 마지막 스텝에서 다시 낸다. (초록불만 보고 넘기지 않도록 X 는 남긴다)
+      - name: 점검
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set +e
+          python -X utf8 watchdog_night.py
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: 판정 커밋
+        run: |
+          git add _watchdog
+          if git diff --cached --quiet; then
+            echo "바뀐 것이 없다 — 커밋 안 함"
+            exit 0
+          fi
+          git commit -m "watchdog: $(date -u '+%Y-%m-%d %H:%M UTC') 판정"
+          # 수집기가 20초마다 커밋하므로 밀린다. 되감고 다시 올린다.
+          # ⚠ `_watchdog` 만 add 했다 — `git add -A` 는 절대 금지다
+          #   (prune 된 `data/` 삭제를 커밋해 원본을 날린다).
+          for i in 1 2 3 4 5 6 7 8; do
+            git pull --rebase --quiet && git push --quiet && { echo "푸시 성공 (시도 $i)"; exit 0; }
+            echo "  시도 $i 밀림"
+            sleep 5
+          done
+          echo "★ 8회 다 밀렸다 — 판정은 다음 회차에 다시 올라간다"
+
+      - name: 이상이면 빨간 X 를 남긴다
+        if: steps.check.outputs.rc != '0'
+        run: |
+          echo "::error::감시가 이상을 찾았다 — _watchdog/status.md 를 볼 것"
+          exit 1
