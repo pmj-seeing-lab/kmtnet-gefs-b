@@ -99,13 +99,29 @@ def check_members(bad, info):
        실제로는 실패 0이었다.
 
        그래서 **커밋 하나 안의 비율**만 본다 — `fail / (ok + fail)` 는 같은 세션의
-       같은 순간 값이므로 섞임과 무관하다. 멤버별로 그중 **가장 나쁜 것**과
-       **중앙값**을 보고, 시도가 충분히 쌓인 커밋만 센다(잡 시작 직후의 `ok 0 fail 0`
-       같은 잡음을 뺀다).
+       같은 순간 값이므로 섞임과 무관하다. 시도가 충분히 쌓인 커밋만 후보로 삼는다
+       (잡 시작 직후의 `ok 0 fail 0` 같은 잡음을 뺀다).
+
+       그중 **`ok` 가 가장 큰 커밋**(= 세션 끝에 가장 가까운 지점)의 비율로 판정한다.
+       ⚠ 예전에는 **가장 나쁜 비율**로 판정했는데 그게 오탐을 낳았다 —
+         `fail` 은 «없는 파일» 몇십 개로 고정되고 `ok` 만 오르므로 비율이 세션 내내
+         떨어진다. 초반 `ok 160 fail 40`(20%)이 잡혀 정상 세션마다 경보가 떴다.
 
        (워커가 `night m{M}/{구간} ...` 로 구간을 적기 시작하면 합계도 정확해진다.
         지금 규칙은 구간 표시가 있든 없든 똑같이 동작한다.)"""
     MIN_TRIES = 200           # 이만큼은 시도한 커밋만 비율 판정에 쓴다
+    # ★ 2026-09-02 — **「최악 비율」로 판정하던 것을 「세션이 익은 시점의 비율」로 바꿨다.**
+    #   왜: `fail` 은 «없는 파일» 몇십 개로 **고정**되는데 `ok` 는 계속 오른다.
+    #   그래서 한 세션 안에서 비율이 계속 **떨어진다** —
+    #       ok 160 fail 40 → 20%   ...   ok 2000 fail 40 → 2%
+    #   최악(=초반) 비율을 잡으면 정상 세션마다 경보가 뜬다. 실제로 2026-09-02 에
+    #   A m1 34.5% · B m5 20.5% · m6 21.5% 로 떴는데, 같은 세션의 종료 커밋은
+    #   `fail 0` 이었다. **늘 울리는 경보는 진짜 정지를 가린다** (F-201 이 그렇게 숨었다).
+    #
+    #   그래서 멤버별로 **`ok` 가 가장 큰 커밋**(= 그 잡의 세션 끝에 가장 가까운 지점)의
+    #   비율으로 판정한다. 「최악 비율」은 참고로 계속 적지만 경보에 쓰지 않는다.
+    #   ⚠ 죽은 잡(`ok 0 fail 5,617`)은 `ok` 가 안 커서 이 규칙에 안 걸린다 —
+    #     그건 아래 「성공 0건」 검사가 따로 잡는다. 두 검사는 겹치지 않는다.
     since = f"{LOOKBACK_H} hours ago"
     rc, out, _ = sh("git", "log", f"--since={since}", "--format=%ct%x09%s", "-4000")
     seq = collections.defaultdict(list)          # 멤버 -> [(ok, fail, rate)]
@@ -136,8 +152,14 @@ def check_members(bad, info):
         zero_ok = [(o, f) for o, f in usable if o == 0]
         rate_med = med_of([r for _, _, r in rows])
         worst = max(ratios) if ratios else 0.0
+        # 판정에 쓰는 값 — `ok` 가 가장 큰 커밋(세션 끝에 가장 가까운 지점)의 비율
+        mature = max((x for x in usable if x[0] > 0), key=lambda x: x[0], default=None)
+        final = (mature[1] / (mature[0] + mature[1])) if mature else 0.0
         out_rows[mem] = {"커밋수": len(rows), "판정에쓴커밋": len(usable),
-                         "최악실패율": round(worst, 4),
+                         "판정실패율": round(final, 4),
+                         "판정근거_ok": mature[0] if mature else 0,
+                         "판정근거_fail": mature[1] if mature else 0,
+                         "최악실패율_참고": round(worst, 4),
                          "중앙실패율": round(med_of(ratios), 4),
                          "중앙속도": round(rate_med, 1),
                          "성공0건커밋": len(zero_ok)}
@@ -145,15 +167,19 @@ def check_members(bad, info):
             mx = max(f for _, f in zero_ok)
             bad.append(f"m{mem}: **성공 0건인 커밋 {len(zero_ok)}개** (최대 실패 {mx:,}) "
                        f"— 2026-09-01 의 m5·m8 과 같은 증상이다")
-        elif worst > FAIL_RATE_BAD:
-            bad.append(f"m{mem}: 한 세션 실패율이 최대 {100*worst:.1f}% 까지 갔다 "
+        elif final > FAIL_RATE_BAD:
+            bad.append(f"m{mem}: 세션이 익은 지점의 실패율 {100*final:.1f}% "
+                       f"(ok {mature[0]:,} fail {mature[1]:,}) "
                        f"— 문턱 {100*FAIL_RATE_BAD:.0f}% 초과")
         if rate_med_all > 0 and rate_med < rate_med_all * SLOW_FRAC:
             bad.append(f"m{mem}: 중앙 {rate_med:.0f}단위/시간 — 전체 중앙 "
                        f"{rate_med_all:.0f} 의 {100*rate_med/rate_med_all:.0f}% 밖에 안 된다")
     info["전체중앙속도"] = round(rate_med_all, 1)
-    info["판정규칙"] = (f"커밋 하나 안의 fail/(ok+fail) 만 본다. 합계는 세션 누적값이 "
-                        f"여러 잡에서 섞여 못 쓴다. 시도 {MIN_TRIES}건 이상인 커밋만 판정.")
+    info["판정규칙"] = (f"멤버별로 **ok 가 가장 큰 커밋**(세션 끝에 가장 가까운 지점)의 "
+                        f"fail/(ok+fail) 로 판정한다. 합계는 세션 누적값이 여러 잡에서 "
+                        f"섞여 못 쓰고, 「최악 비율」은 fail 이 고정된 채 ok 만 오르는 "
+                        f"구조상 세션 초반을 잡아 늘 울린다 (2026-09-02 오탐). "
+                        f"시도 {MIN_TRIES}건 이상인 커밋만 후보.")
     return out_rows
 
 
@@ -270,13 +296,15 @@ def write_status(bad, info, members):
     L.append(f"## 멤버별 (최근 {LOOKBACK_H}시간 커밋 기준)")
     L.append("")
     if members:
-        L.append("| 멤버 | 커밋 | 판정에 쓴 커밋 | 최악 실패율 | 중앙 실패율 "
+        L.append("| 멤버 | 커밋 | 판정 실패율 (근거 ok/fail) | 최악(참고) | 중앙 "
                  "| 중앙 단위/시간 | 성공 0건 커밋 |")
         L.append("|---|---|---|---|---|---|---|")
         for m in sorted(members):
             r = members[m]
-            L.append(f"| m{m} | {r['커밋수']} | {r['판정에쓴커밋']} | "
-                     f"{100*r['최악실패율']:.1f}% | {100*r['중앙실패율']:.1f}% | "
+            L.append(f"| m{m} | {r['커밋수']} | "
+                     f"{100*r['판정실패율']:.1f}% "
+                     f"({r['판정근거_ok']:,}/{r['판정근거_fail']:,}) | "
+                     f"{100*r['최악실패율_참고']:.1f}% | {100*r['중앙실패율']:.1f}% | "
                      f"{r['중앙속도']:.0f} | {r['성공0건커밋']} |")
         L.append("")
         L.append("⚠ **합계를 적지 않는다.** 커밋의 `ok`·`fail` 은 세션 누적값이고 한 멤버에 "
@@ -317,7 +345,9 @@ def main():
         for m in sorted(members):
             r = members[m]
             print(f"  m{m}: 커밋 {r['커밋수']:>4} (판정 {r['판정에쓴커밋']:>4}) · "
-                  f"최악 실패율 {100*r['최악실패율']:>5.1f}% · "
+                  f"판정 실패율 {100*r['판정실패율']:>5.1f}% "
+                  f"(ok {r['판정근거_ok']:,} fail {r['판정근거_fail']:,}) · "
+                  f"최악(참고) {100*r['최악실패율_참고']:>5.1f}% · "
                   f"중앙 {100*r['중앙실패율']:>5.1f}% · "
                   f"{r['중앙속도']:>6.0f}단위/시간 · 성공0건 {r['성공0건커밋']}")
     print()
