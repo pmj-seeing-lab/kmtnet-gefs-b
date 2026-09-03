@@ -31,6 +31,8 @@
     C 연도 파일 충돌        night.yml 구간을 펼쳐 두 구간에 속한 연도가 있나 (①② 회귀 가드)
     D 최근 24시간 실행      성공이 하나라도 있나
     E 수집이 살아 있나      가장 최근 `night ` 커밋이 얼마나 오래됐나
+    F 진행률이 늘고 있나    잡 로그의 `할 일 N (이미 N)` 을 읽어 멤버별 %,
+                           그리고 **지난 판정 대비 안 늘었으면** 이상
 
 쓰는 법
     python -X utf8 watchdog_night.py            # 점검하고 상태 파일을 쓴다 (Actions 가 부른다)
@@ -69,6 +71,25 @@ LOOKBACK_H = 6            # 실패율을 셀 창. 한 세션(5시간)보다 조�
 #  `night m4 ok 2160 fail 0 (908/h)` 와 `night m4/2020-01 ok ...` 를 둘 다 받는다.
 #  (워커가 구간을 적기 시작해도 이 규칙이 그대로 먹는다.)
 CM = re.compile(r"night m(\d+)(?:/[\w-]+)? ok (\d+) fail (\d+) \((\d+)/h\)")
+
+#  워커가 시작할 때 찍는 진행 줄 (`worker_night.py` 332~334행):
+#      [m0] 리드 28개(…) / 57개(…) · 사이클 3,148 · 할 일 12,345 (이미 138,178) · 워커 6
+#  `이미` = `done_keys(M)` — 그 멤버가 **전 연도에서** 이미 받은 (사이클, 리드) 수.
+#          구간과 무관하므로 같은 멤버의 잡 4개가 같은 값을 찍는다.
+#  `할 일` = **그 구간에** 남은 수. 구간마다 다르므로 4개를 더해야 멤버 잔량이다.
+#  ⇒ 분모 = 이미 + Σ(구간별 할 일)
+#  ⚠ 커밋 메시지의 ok/fail 로는 이걸 못 낸다 — 세션 누적값이고 구간이 안 적혀 섞인다
+#    (검사 A 의 머리말 참조). 그래서 진행률만 잡 로그를 읽는다.
+PG = re.compile(r"\[m(\d+)\].*?할 일 ([\d,]+) \(이미 ([\d,]+)\)")
+PROGRESS_STALL = True     # 지난 판정보다 안 늘면 이상으로 잡는다
+# 이 비율을 넘으면 **완주로 본다.** 그러면 「커밋이 없다」·「커밋이 오래됐다」를
+# 이상으로 잡지 않는다 — 받을 것이 없으니 커밋도 없는 게 맞다.
+#   ★ 2026-09-03 에 필요해졌다. 계정 A 가 멤버 0~4 를 100.0% 끝내자
+#     감시가 「최근 6시간에 커밋이 하나도 없다」+「마지막 커밋 1,549분 전」으로
+#     이상 2건을 울렸다. 둘 다 사실이지만 **고장이 아니라 완주**였다.
+#   왜 100% 가 아니라 99.9% 인가: 멤버당 36~69 단위가 영구히 남는다 —
+#     NOAA 아카이브에 그 사이클이 아예 없다. 100% 를 기다리면 영원히 안 온다.
+PROGRESS_DONE_PCT = 99.9
 
 
 def sh(*a):
@@ -135,8 +156,13 @@ def check_members(bad, info):
         seq[int(m.group(1))].append(
             (int(m.group(2)), int(m.group(3)), int(m.group(4))))
     if not seq:
-        bad.append(f"최근 {LOOKBACK_H}시간에 `night m.. ok .. fail ..` 커밋이 하나도 없다 "
-                   f"— 수집이 안 돌거나 커밋 형식이 바뀌었다")
+        if _is_done(info):
+            info["커밋없음_사유"] = (
+                f"완주 {info['진행률']['합계비율']}% — 받을 것이 없으니 커밋도 없다. "
+                f"이상으로 잡지 않는다.")
+        else:
+            bad.append(f"최근 {LOOKBACK_H}시간에 `night m.. ok .. fail ..` 커밋이 하나도 없다 "
+                       f"— 수집이 안 돌거나 커밋 형식이 바뀌었다")
         return {}
 
     def med_of(v):
@@ -246,6 +272,117 @@ def check_spans(bad, info):
 
 
 # ── D·E. 실행 상태와 커밋 신선도 ─────────────────────────────────────
+def _is_done(info):
+    """진행률이 완주선을 넘었나. 진행률을 못 읽었으면 **False** — 모르면 울린다."""
+    pg = info.get("진행률")
+    if not isinstance(pg, dict) or pg.get("로그못읽은잡"):
+        return False
+    r = pg.get("합계비율")
+    return isinstance(r, (int, float)) and r >= PROGRESS_DONE_PCT
+
+
+# ── F. 진행률 ────────────────────────────────────────────────────────
+def _last_progress():
+    """지난 판정의 멤버별 `받음` 을 `history.jsonl` 마지막 줄에서 읽는다."""
+    p = os.path.join(OUT, "history.jsonl")
+    if not os.path.exists(p):
+        return {}, None
+    last = None
+    for line in io.open(p, encoding="utf-8"):
+        if line.strip():
+            last = line
+    if not last:
+        return {}, None
+    try:
+        rec = json.loads(last)
+    except Exception:
+        return {}, None
+    pg = (rec.get("정보") or {}).get("진행률") or {}
+    return {k: v.get("받음") for k, v in (pg.get("멤버") or {}).items()}, rec.get("t")
+
+
+def check_progress(bad, info):
+    """잡 로그에서 멤버별 진행률을 읽는다.
+
+    ⚠ `이미` 는 잡이 **시작한 시점**의 값이다 — 실행 중이면 실제로는 더 받았다.
+      그래서 「안 늘었다」 판정은 **실행이 새로 시작한 뒤**에만 뜻이 있다.
+      같은 실행을 두 번 읽으면 당연히 같은 값이라, 실행 id 가 바뀌었을 때만 비교한다.
+    """
+    if not REPO:
+        info["진행률"] = "GITHUB_REPOSITORY 가 없어 못 봤다"
+        return
+    runs = gh_json(f"repos/{REPO}/actions/workflows/night.yml/runs?per_page=6")
+    if not runs:
+        info["진행률"] = "실행 목록을 못 받았다"
+        return
+    rid = created = jobs = None
+    for r in runs.get("workflow_runs", []):
+        jj = gh_json(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=40")
+        if not jj:
+            continue
+        js = [j for j in jj.get("jobs", []) if j.get("started_at")]
+        if js:
+            rid, created, jobs = r["id"], r.get("created_at"), js
+            break
+    if not jobs:
+        info["진행률"] = "시작한 잡이 있는 실행이 없다"
+        return
+
+    per, unread = {}, 0
+    for j in jobs:
+        rc, out, _ = sh("gh", "api", f"repos/{REPO}/actions/jobs/{j['id']}/logs")
+        if rc != 0:
+            unread += 1
+            continue
+        m = PG.search(out)
+        if not m:
+            unread += 1
+            continue
+        mem = int(m.group(1))
+        todo = int(m.group(2).replace(",", ""))
+        seen = int(m.group(3).replace(",", ""))
+        d = per.setdefault(mem, {"받음": seen, "할일": []})
+        d["받음"] = max(d["받음"], seen)
+        d["할일"].append(todo)
+
+    if not per:
+        info["진행률"] = f"잡 {len(jobs)}개의 로그에서 진행 줄을 못 찾았다"
+        return
+
+    rows, tot_d, tot_a = {}, 0, 0
+    for mem, d in sorted(per.items()):
+        done, left = d["받음"], sum(d["할일"])
+        allq = done + left
+        rows[f"m{mem}"] = {"받음": done, "전체": allq, "남은": left,
+                           "비율": round(done / allq * 100, 1) if allq else 0.0,
+                           "읽은구간": len(d["할일"])}
+        tot_d += done
+        tot_a += allq
+    info["진행률"] = {"실행": rid, "생성": created, "멤버": rows,
+                      "합계받음": tot_d, "합계전체": tot_a,
+                      "합계비율": round(tot_d / tot_a * 100, 1) if tot_a else 0.0,
+                      "로그못읽은잡": unread}
+
+    # 안 늘었나 — **다른 실행**과 비교할 때만
+    prev, prev_t = _last_progress()
+    prev_rid = None
+    hp = os.path.join(OUT, "history.jsonl")
+    if os.path.exists(hp):
+        for line in io.open(hp, encoding="utf-8"):
+            if line.strip():
+                try:
+                    prev_rid = (json.loads(line).get("정보") or {}).get(
+                        "진행률", {}).get("실행")
+                except Exception:
+                    pass
+    if PROGRESS_STALL and prev and prev_rid and prev_rid != rid:
+        stuck = [k for k, v in rows.items()
+                 if k in prev and prev[k] is not None and v["받음"] <= prev[k]]
+        if stuck:
+            bad.append(f"진행률이 안 늘었다 — {', '.join(sorted(stuck))} "
+                       f"(지난 판정 {prev_t} · 실행 {prev_rid} → {rid})")
+
+
 def check_runs(bad, info):
     if REPO:
         runs = gh_json(f"repos/{REPO}/actions/workflows/night.yml/runs?per_page=12")
@@ -272,8 +409,13 @@ def check_runs(bad, info):
         age = (time.time() - newest) / 60
         info["마지막수집커밋"] = f"{age:.0f}분 전"
         if age > COMMIT_STALE_MIN:
-            bad.append(f"마지막 `night ` 커밋이 **{age:.0f}분 전**이다 "
-                       f"— 문턱 {COMMIT_STALE_MIN}분 초과")
+            if _is_done(info):
+                info["마지막수집커밋_사유"] = (
+                    f"완주 {info['진행률']['합계비율']}% — 오래된 것이 맞다. "
+                    f"이상으로 잡지 않는다.")
+            else:
+                bad.append(f"마지막 `night ` 커밋이 **{age:.0f}분 전**이다 "
+                           f"— 문턱 {COMMIT_STALE_MIN}분 초과")
 
 
 # ── 상태 파일 ────────────────────────────────────────────────────────
@@ -291,7 +433,7 @@ def write_status(bad, info, members):
         for b in bad:
             L.append(f"- {b}")
     else:
-        L.append("- 멤버별 실패율·속도, 잡 물결, 연도 파일 충돌, 실행 상태, 커밋 신선도 모두 통과.")
+        L.append("- 멤버별 실패율·속도, 잡 물결, 연도 파일 충돌, 실행 상태, 커밋 신선도, 진행률 모두 통과.")
     L.append("")
     L.append(f"## 멤버별 (최근 {LOOKBACK_H}시간 커밋 기준)")
     L.append("")
@@ -314,6 +456,36 @@ def write_status(bad, info, members):
     else:
         L.append("(자료 없음)")
     L.append("")
+
+    # ── 진행률 ──
+    pg = info.get("진행률")
+    L.append("## 진행률 (잡 로그의 `할 일 N (이미 N)` 기준)")
+    L.append("")
+    if isinstance(pg, dict) and pg.get("멤버"):
+        L.append(f"실행 `{pg.get('실행')}` · {str(pg.get('생성'))[:16]} 기준")
+        L.append("")
+        L.append("| 멤버 | 받음 | 전체 | 남은 | 비율 |")
+        L.append("|---|---|---|---|---|")
+        for k in sorted(pg["멤버"], key=lambda x: int(x[1:])):
+            r = pg["멤버"][k]
+            L.append(f"| {k} | {r['받음']:,} | {r['전체']:,} | "
+                     f"{r['남은']:,} | **{r['비율']}%** |")
+        L.append(f"| **합계** | {pg['합계받음']:,} | {pg['합계전체']:,} | "
+                 f"{pg['합계전체'] - pg['합계받음']:,} | **{pg['합계비율']}%** |")
+        L.append("")
+        if pg.get("로그못읽은잡"):
+            L.append(f"⚠ 잡 {pg['로그못읽은잡']}개는 로그를 못 읽어 빠졌다 — "
+                     f"그 구간의 `할 일` 이 안 들어갔으므로 **전체가 실제보다 작고 "
+                     f"비율은 실제보다 높다.**")
+            L.append("")
+        L.append("⚠ `받음` 은 잡이 **시작한 시점**의 값이다. 실행 중이면 그 뒤로 더 "
+                 "받았으므로 실제 진행률은 이보다 조금 높다. 그래서 「안 늘었다」 "
+                 "판정은 **실행 id 가 바뀐 뒤**에만 한다 — 같은 실행을 두 번 읽으면 "
+                 "당연히 같은 값이다.")
+    else:
+        L.append(f"({pg if pg else '자료 없음'})")
+    L.append("")
+
     L.append("## 그 밖")
     L.append("")
     L.append("```json")
@@ -334,6 +506,9 @@ def write_status(bad, info, members):
 def main():
     dry = "--dry" in sys.argv
     bad, info = [], {}
+    # ★ 진행률을 **먼저** 잰다 — check_members·check_runs 의 「커밋이 없다/오래됐다」
+    #   판정이 완주 여부를 봐야 하기 때문이다 (2026-09-03, 계정 A 완주 오탐).
+    check_progress(bad, info)
     members = check_members(bad, info)
     check_wave(bad, info)
     check_spans(bad, info)
