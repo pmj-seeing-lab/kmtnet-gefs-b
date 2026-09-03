@@ -354,17 +354,31 @@ def check_progress(bad, info):
     if not runs:
         info["진행률"] = "실행 목록을 못 받았다"
         return
+    # ★★ **도는 잡의 로그는 GitHub 이 안 준다** (404). 로그는 잡이 끝난 뒤에
+    #   보관된다. 처음 판은 「가장 최근 실행」을 골라서 Actions 안에서는 늘
+    #   자기 저장소의 **도는** 실행을 보고 매번 「진행 줄을 못 찾았다」가 됐다
+    #   (2026-09-03 실측 — 지역에서는 완료된 실행으로만 시험해서 못 잡았다).
+    #   그래서 **완료된 잡이 있는** 가장 최근 실행을 고른다.
     rid = created = jobs = None
+    fallback = None
     for r in runs.get("workflow_runs", []):
         jj = gh_json(f"repos/{REPO}/actions/runs/{r['id']}/jobs?per_page=40")
         if not jj:
             continue
-        js = [j for j in jj.get("jobs", []) if j.get("started_at")]
-        if js:
-            rid, created, jobs = r["id"], r.get("created_at"), js
+        allj = jj.get("jobs", [])
+        done = [j for j in allj if j.get("status") == "completed"]
+        if done:
+            rid, created, jobs = r["id"], r.get("created_at"), done
             break
+        started = [j for j in allj if j.get("started_at")]
+        if started and fallback is None:
+            fallback = (r["id"], r.get("created_at"), started)
+    if not jobs and fallback:
+        rid, created, jobs = fallback
+        info["진행률_주의"] = ("완료된 잡이 있는 실행이 없어 **도는 실행**을 봤다 — "
+                               "로그가 아직 없어 수가 안 나올 수 있다")
     if not jobs:
-        info["진행률"] = "시작한 잡이 있는 실행이 없다"
+        info["진행률"] = "잡이 있는 실행이 없다"
         return
 
     per, unread = {}, 0
@@ -388,17 +402,44 @@ def check_progress(bad, info):
         info["진행률"] = f"잡 {len(jobs)}개의 로그에서 진행 줄을 못 찾았다"
         return
 
-    rows, tot_d, tot_a = {}, 0, 0
+    # 이 워크플로가 멤버마다 돌리는 구간 수 — 분모가 온전한지 보려면 필요하다.
+    #   ⚠ **구간을 다 못 읽으면 분모가 짧아져 비율이 실제보다 높게 나온다.**
+    #     2026-09-03 실측: 계정 B 의 m9 가 「137,987 / 138,029 = 100.0%」로 찍혔는데
+    #     분모가 150,523 이어야 했다 — 구간 하나의 `할 일` 이 안 들어와서다.
+    #     그래서 읽은 구간 수를 적고, 모자라면 **비율을 내지 않는다.**
+    n_span = 0
+    try:
+        y = io.open(NIGHT_YML, encoding="utf-8").read()
+        n_span = len(re.findall(r"-\s*\{\s*start:", y))
+    except Exception:
+        pass
+
+    rows, tot_d, tot_a, short = {}, 0, 0, []
     for mem, d in sorted(per.items()):
         done, left = d["받음"], sum(d["할일"])
         allq = done + left
-        rows[f"m{mem}"] = {"받음": done, "전체": allq, "남은": left,
-                           "비율": round(done / allq * 100, 1) if allq else 0.0,
-                           "읽은구간": len(d["할일"])}
-        tot_d += done
-        tot_a += allq
+        got = len(d["할일"])
+        full = (n_span == 0) or (got >= n_span)
+        if not full:
+            short.append(f"m{mem}({got}/{n_span})")
+        rows[f"m{mem}"] = {"받음": done, "전체": allq if full else None, "남은": left,
+                           "비율": (round(done / allq * 100, 1) if (allq and full)
+                                    else None),
+                           "읽은구간": got, "구간수": n_span,
+                           "분모온전": full}
+        # ⚠ 합계는 **분모가 온전한 멤버만** 더한다. 분자만 더하고 분모를 빼면
+        #   합계가 160% 같은 값이 된다 (2026-09-03 에 내가 그렇게 깨뜨렸다).
+        if full:
+            tot_d += done
+            tot_a += allq
+    if short:
+        info["진행률_분모모자람"] = (
+            f"구간을 다 못 읽은 멤버: {', '.join(short)} — 그 멤버의 `전체`·`비율` 은 "
+            f"비워 뒀다. 분모가 짧으면 비율이 실제보다 높게 나온다.")
     info["진행률"] = {"실행": rid, "생성": created, "멤버": rows,
                       "합계받음": tot_d, "합계전체": tot_a,
+                      "합계에든멤버": sum(1 for r in rows.values() if r["분모온전"]),
+                      "멤버수": len(rows),
                       "합계비율": round(tot_d / tot_a * 100, 1) if tot_a else 0.0,
                       "로그못읽은잡": unread}
 
@@ -503,20 +544,29 @@ def write_status(bad, info, members):
     if isinstance(pg, dict) and pg.get("멤버"):
         L.append(f"실행 `{pg.get('실행')}` · {str(pg.get('생성'))[:16]} 기준")
         L.append("")
-        L.append("| 멤버 | 받음 | 전체 | 남은 | 비율 |")
-        L.append("|---|---|---|---|---|")
+        L.append("| 멤버 | 받음 | 전체 | 남은 | 비율 | 읽은 구간 |")
+        L.append("|---|---|---|---|---|---|")
         for k in sorted(pg["멤버"], key=lambda x: int(x[1:])):
             r = pg["멤버"][k]
-            L.append(f"| {k} | {r['받음']:,} | {r['전체']:,} | "
-                     f"{r['남은']:,} | **{r['비율']}%** |")
-        L.append(f"| **합계** | {pg['합계받음']:,} | {pg['합계전체']:,} | "
-                 f"{pg['합계전체'] - pg['합계받음']:,} | **{pg['합계비율']}%** |")
+            tot = f"{r['전체']:,}" if r.get("전체") else "—"
+            pct = f"**{r['비율']}%**" if r.get("비율") is not None else "**—**"
+            sp = f"{r.get('읽은구간','?')}/{r.get('구간수','?')}"
+            if not r.get("분모온전", True):
+                sp += " ★"
+            L.append(f"| {k} | {r['받음']:,} | {tot} | {r['남은']:,} | {pct} | {sp} |")
+        if pg.get("합계전체"):
+            L.append(f"| **합계** | {pg['합계받음']:,} | {pg['합계전체']:,} | "
+                     f"{pg['합계전체'] - pg['합계받음']:,} | "
+                     f"**{pg['합계비율']}%** | |")
         L.append("")
         if pg.get("로그못읽은잡"):
-            L.append(f"⚠ 잡 {pg['로그못읽은잡']}개는 로그를 못 읽어 빠졌다 — "
-                     f"그 구간의 `할 일` 이 안 들어갔으므로 **전체가 실제보다 작고 "
-                     f"비율은 실제보다 높다.**")
+            L.append(f"⚠ 잡 {pg['로그못읽은잡']}개는 로그를 못 읽어 빠졌다.")
             L.append("")
+        L.append("⚠ **`읽은 구간` 이 모자란 멤버는 `전체`·`비율` 을 비워 뒀다.** "
+                 "분모가 짧으면 비율이 실제보다 높게 나온다 — 2026-09-03 에 계정 B 의 "
+                 "m9 가 「137,987 / 138,029 = 100.0%」로 찍혔는데 분모가 150,523 "
+                 "이어야 했다. 구간 하나의 `할 일` 이 안 들어와서다.")
+        L.append("")
         L.append("⚠ `받음` 은 잡이 **시작한 시점**의 값이다. 실행 중이면 그 뒤로 더 "
                  "받았으므로 실제 진행률은 이보다 조금 높다. 그래서 「안 늘었다」 "
                  "판정은 **실행 id 가 바뀐 뒤**에만 한다 — 같은 실행을 두 번 읽으면 "
