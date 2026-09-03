@@ -27,7 +27,9 @@
 
 무엇을 보나 (자료 파일은 안 건드린다 — 커밋 메시지 + Actions API + 워크플로 파일뿐)
     A 멤버별 실패율·속도    최근 커밋의 `night m{M} ok N fail M (R/h)` 를 센다
-    B 잡이 한 물결인가      최신 night 실행의 잡 시작시각이 전부 같은 분인가
+    B 잡이 한 물결인가      최신 night 실행에서 **러너가 붙은** 잡의 시작시각이
+                           전부 같은 분인가 (⚠ `started_at` 은 대기 잡도 찍힌다 —
+                           `runner_name` 이 진짜 신호다)
     C 연도 파일 충돌        night.yml 구간을 펼쳐 두 구간에 속한 연도가 있나 (①② 회귀 가드)
     D 최근 24시간 실행      성공이 하나라도 있나
     E 수집이 살아 있나      가장 최근 `night ` 커밋이 얼마나 오래됐나
@@ -231,22 +233,59 @@ def check_wave(bad, info):
         info["물결"] = f"실행 #{r0['id']} 의 잡을 못 받았다"
         return
     js = jobs.get("jobs", [])
-    starts = collections.Counter(str(j.get("started_at"))[:16] for j in js if j.get("started_at"))
+
+    # ★★ **`started_at` 만 보면 안 된다** (2026-09-03 실측으로 알아낸 것).
+    #   대기 중인 잡도 `started_at` 이 찍히는데, 그 값은 `created_at` 과 **같다**
+    #   — 즉 「대기 시작」이지 「실행 시작」이 아니다. 러너가 안 붙은 잡도 같은
+    #   시각을 찍으므로, 이 필드만 세면 **대기 20개를 「한 물결 20잡」으로** 읽는다.
+    #   실측: erpcosmos2026 실행 #33725134142 은 잡 20개가 전부 06:50:40 에
+    #   `started_at` 이 찍혔지만 **러너는 6개만 붙었고 14개는 queued** 였다.
+    #   그래서 「erp 는 즉시 20레인」이라는 틀린 결론을 냈다.
+    #
+    #   진짜 신호는 **`runner_name` 이 비어 있지 않은가**다. 러너가 배정되면 채워진다
+    #   (`GitHub Actions 1000000007` 처럼, 계정마다 번호가 이어진다).
+    def _has_runner(j):
+        rn = j.get("runner_name")
+        return bool(rn) and str(rn).strip() != ""
+
+    live = [j for j in js if _has_runner(j)]
+    waiting = [j for j in js if not _has_runner(j)]
+    # 물결은 **러너가 붙은 잡의** started_at 으로만 센다.
+    starts = collections.Counter(str(j.get("started_at"))[:16] for j in live
+                                 if j.get("started_at"))
     info["최신실행"] = {"id": r0["id"], "상태": r0.get("status"),
                         "결론": r0.get("conclusion"), "생성": r0.get("created_at"),
-                        "잡수": len(js), "시작시각별": dict(sorted(starts.items()))}
+                        "잡수": len(js), "러너붙음": len(live),
+                        "러너없음": len(waiting),
+                        "시작시각별": dict(sorted(starts.items()))}
     if len(js) == 0:
         # 잡 0개는 **정상**이다 — 동시성 그룹이 중복 대기를 버린 것이고 손실이 없다.
         info["물결"] = "잡 0개 — 중복 대기가 버려진 실행이다 (정상)"
         return
-    if len(starts) > 1:
+    if not live:
+        info["물결"] = (f"러너가 붙은 잡이 없다 — 잡 {len(js)}개 전부 대기 중. "
+                        f"방금 만든 실행이면 정상이다.")
+        return
+
+    # 이 계정이 실제로 쓰는 레인 수 = 동시에 러너가 붙은 최대치.
+    #   ⚠ 새 계정·새 조직은 여기가 **5~6 에서 시작해 며칠에 걸쳐 20 으로 오른다**
+    #     (실측: 조직 B 5→9→12→14→17→19→20, 사흘 · 계속 돌린 경우.
+    #      erpcosmos2026 은 6일 놀린 뒤 5→6 밖에 안 올랐다 —
+    #      **달력 시간이 아니라 돌린 양으로 오른다**).
+    #     그러니 이건 고장이 아니다. 「행렬을 줄일 것」이라고 하지 않는다.
+    info["레인"] = len(live)
+    if waiting:
+        info["물결"] = (f"러너 {len(live)}개 · 대기 {len(waiting)}개 — 이 계정의 "
+                        f"동시 상한이 {len(live)} 이다. 새 계정이면 돌릴수록 오른다.")
+    elif len(starts) > 1:
         big = max(starts.values())
-        tail = len(js) - big
+        tail = len(live) - big
         bad.append(f"잡이 **{len(starts)}개 물결**로 갈렸다 — {dict(sorted(starts.items()))}. "
                    f"뒤쪽 {tail}개가 앞 물결을 기다리는 동안 {big}슬롯이 놀게 된다. "
                    f"행렬을 {big}잡 이하로 줄일 것 (2026-09-01 에 계정 B 가 17+3 이었다)")
     else:
-        info["물결"] = f"한 물결 — 잡 {len(js)}개가 전부 {list(starts)[0]} 에 시작"
+        info["물결"] = (f"한 물결 — 러너 붙은 잡 {len(live)}개가 전부 "
+                        f"{list(starts)[0]} 에 시작")
 
 
 # ── C. 연도 파일 충돌 (F-200 회귀 가드) ──────────────────────────────
