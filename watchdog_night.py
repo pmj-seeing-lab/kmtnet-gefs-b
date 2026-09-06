@@ -211,21 +211,6 @@ def check_members(bad, info):
     return out_rows
 
 
-
-def _max_parallel():
-    """`night.yml` 의 `max-parallel` 을 읽는다. 못 읽으면 None.
-
-    ⚠ 물결 판정에 쓴다. **잡 수가 이 값보다 많으면 물결이 여러 개인 것이 설계대로**다 —
-      대기열이 있으니 앞 잡이 끝나는 대로 슬롯이 채워진다.
-    """
-    try:
-        txt = io.open(NIGHT_YML, encoding="utf-8").read()
-    except Exception:
-        return None
-    m = re.search(r"^\s*max-parallel:\s*(\d+)", txt, re.M)
-    return int(m.group(1)) if m else None
-
-
 # ── B. 잡이 한 물결인가 ─────────────────────────────────────────────
 def check_wave(bad, info):
     if not REPO:
@@ -290,27 +275,25 @@ def check_wave(bad, info):
     #     그러니 이건 고장이 아니다. 「행렬을 줄일 것」이라고 하지 않는다.
     info["레인"] = len(live)
     if waiting:
-        info["물결"] = (f"러너 {len(live)}개 · 대기 {len(waiting)}개 — 이 계정의 "
-                        f"동시 상한이 {len(live)} 이다. 새 계정이면 돌릴수록 오른다.")
+        mp0 = _max_parallel()
+        # ★ **누적을 동시 상한이라 부르면 안 된다** (2026-09-07 고침).
+        #   `live` 는 「러너가 붙은 적 있는 잡」이라 **누적**이다. 잡 수가 슬롯보다
+        #   많아지면(28잡·19슬롯) 앞 잡이 끝나며 뒤가 이어받아 26·24 처럼 올라가고,
+        #   그걸 「이 계정의 동시 상한이 26」이라고 적어 **무료 상한 20 과 어긋나는
+        #   수를 내놓았다.** 대기열이 있는 판에서는 이 값으로 상한을 못 읽는다.
+        if mp0 is not None and len(js) > mp0:
+            info["물결"] = (f"러너가 붙은 잡 {len(live)}개(누적) · 대기 {len(waiting)}개 "
+                            f"— 잡 {len(js)}개가 슬롯 {mp0}개보다 많아 대기열이 도는 중이다. "
+                            f"이 수로는 계정 동시 상한을 읽을 수 없다(누적이라 상한을 넘는다).")
+        else:
+            info["물결"] = (f"러너 {len(live)}개 · 대기 {len(waiting)}개 — 이 계정의 "
+                            f"동시 상한이 {len(live)} 이다. 새 계정이면 돌릴수록 오른다.")
     elif len(starts) > 1:
         big = max(starts.values())
         tail = len(live) - big
-        mp = _max_parallel()
-        # ★★ **잡 수가 슬롯보다 많으면 물결은 정상이다** (2026-09-07 고침).
-        #   이 규칙은 「잡 20개 · 슬롯 20개」 시절 것이다. 그때는 전부 한 번에
-        #   떠야 하므로 17+3 은 곧 「17슬롯이 5시간 논다」였다.
-        #   2026-09-06 에 다음 라운드 멤버를 붙여 잡이 28개가 되면서, 앞 잡이
-        #   끝나는 대로 대기열이 슬롯을 이어받는 **설계된 동작**이 5개 물결로
-        #   보였고 레인 C 가 거짓 경보를 냈다. 거짓 경보는 진짜 경보를 묻는다.
-        if mp is not None and len(js) > mp:
-            info["물결"] = (f"{len(starts)}개 물결 — 잡 {len(js)}개가 슬롯 {mp}개보다 "
-                            f"많아 대기열이 순서대로 들어간 것이다 (정상). "
-                            f"{dict(sorted(starts.items()))}")
-        else:
-            bad.append(f"잡이 **{len(starts)}개 물결**로 갈렸다 — {dict(sorted(starts.items()))}. "
-                       f"뒤쪽 {tail}개가 앞 물결을 기다리는 동안 {big}슬롯이 놀게 된다. "
-                       f"잡 {len(js)}개 · 슬롯 {mp} 라 전부 한 번에 떠야 하는데 안 떴다. "
-                       f"행렬을 {big}잡 이하로 줄일 것 (2026-09-01 에 계정 B 가 17+3 이었다)")
+        bad.append(f"잡이 **{len(starts)}개 물결**로 갈렸다 — {dict(sorted(starts.items()))}. "
+                   f"뒤쪽 {tail}개가 앞 물결을 기다리는 동안 {big}슬롯이 놀게 된다. "
+                   f"행렬을 {big}잡 이하로 줄일 것 (2026-09-01 에 계정 B 가 17+3 이었다)")
     else:
         info["물결"] = (f"한 물결 — 러너 붙은 잡 {len(live)}개가 전부 "
                         f"{list(starts)[0]} 에 시작")
