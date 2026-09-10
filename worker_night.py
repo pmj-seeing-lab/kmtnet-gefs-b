@@ -318,6 +318,15 @@ def main():
     #   답이 「값어치 있다」면 STRIDE 를 1 로 되돌려 그대로 이어받으면 된다(재개형).
     #   솎아도 밤 대부분은 덮인다 — 발행일 하나가 앞으로 7일 밤을 덮기 때문이다.
     STRIDE = max(1, int(os.environ.get("STRIDE", "1")))
+    # ★ 한 해를 여러 잡이 나눠 받을 때 쓰는 꼬리표 (2026-09-11).
+    #   왜: 남은 일이 2023·2025 두 해에만 몰려 있는데, 파일이 `{연도}_m{멤버}` 라서
+    #   한 해를 한 잡만 쓸 수 있었다. 그래서 가장 무거운 잡이 353사이클을 혼자 갔다.
+    #   꼬리표를 붙이면 `2023a_m28` · `2023b_m28` 처럼 **파일이 갈려** 동시에 받아도
+    #   git 병합이 한쪽을 버리지 않는다.
+    #   ⚠ 재개는 그대로 된다 — `done_keys()` 의 glob 이 `*_m{멤버}.jsonl.gz` 라
+    #     꼬리표가 붙어도 잡힌다 (2026-09-11 검사함).
+    #   ⚠ 안 주면 **예전과 똑같은 파일 이름**이 나온다. 기본값이 빈 문자열이다.
+    SHARD = os.environ.get("SHARD", "")
     cyc = pd.date_range(START, END, freq="D")
     if STRIDE > 1:
         # 기준을 START 가 아니라 고정 원점으로 잡는다 — 기간 분할이 달라도 같은 날을 고른다
@@ -369,7 +378,7 @@ def main():
             submit_more(1)
             if (ok + fail) % COMMIT_EVERY == 0 and buf:
                 for yr, rows in buf.items():
-                    p = os.path.join(DATA, f"{yr}_m{M}.jsonl.gz")
+                    p = os.path.join(DATA, f"{yr}{SHARD}_m{M}.jsonl.gz")
                     with gzip.open(p, "at", encoding="utf-8") as g:
                         for r in rows:
                             g.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -384,7 +393,7 @@ def main():
                 print(f"  ok {ok:,} fail {fail} · {el/60:.1f}분 · {rate:.0f}작업/시간", flush=True)
                 purge_cache()
     for yr, rows in buf.items():
-        p = os.path.join(DATA, f"{yr}_m{M}.jsonl.gz")
+        p = os.path.join(DATA, f"{yr}{SHARD}_m{M}.jsonl.gz")
         with gzip.open(p, "at", encoding="utf-8") as g:
             for r in rows:
                 g.write(json.dumps(r, ensure_ascii=False) + "\n")
