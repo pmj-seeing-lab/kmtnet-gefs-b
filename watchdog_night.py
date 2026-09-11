@@ -333,20 +333,29 @@ def check_spans(bad, info):
         info["구간"] = "night.yml 을 못 찾았다"
         return
     txt = io.open(NIGHT_YML, encoding="utf-8").read()
-    spans = re.findall(r'start:\s*"(\d{4})-\d{2}-\d{2}".*?end:\s*"(\d{4})-\d{2}-\d{2}"', txt)
+    # ★★ **꼬리표를 셈에 넣는다** (2026-09-11). 예전에는 연도만 보고 충돌을 판정했다.
+    #   그런데 `worker_night.py` 에 `SHARD` 가 생겨 파일 이름이 `{연도}{꼬리표}_m{멤버}` 다.
+    #   2023 을 네 구간이 나눠 써도 `2023a`·`2023b`·`2023c`·`2023d` 로 **파일이 갈린다.**
+    #   꼬리표를 안 보면 그걸 충돌로 읽어 **3시간마다 거짓 경보**를 낸다
+    #   (2026-09-10 23:20 에 실제로 그렇게 떴다). 거짓 경보는 진짜 경보를 묻는다.
+    #   ⇒ 충돌 판정의 열쇠는 **연도가 아니라 「연도+꼬리표」**, 곧 실제 파일 이름이다.
+    #   ⚠ 꼬리표가 없는 옛 구간 표기도 그대로 잡는다 (`shard:` 를 선택 항목으로 뒀다).
+    spans = re.findall(
+        r'start:\s*"(\d{4})-\d{2}-\d{2}"\s*,\s*end:\s*"(\d{4})-\d{2}-\d{2}"'
+        r'\s*(?:,\s*shard:\s*"([A-Za-z0-9]*)")?', txt)
     mem = re.search(r"member:\s*\[([0-9,\s]+)\]", txt)
     nmem = len([x for x in mem.group(1).split(",") if x.strip()]) if mem else 0
     own = collections.defaultdict(list)
-    for i, (a, b) in enumerate(spans):
+    for i, (a, b, sh) in enumerate(spans):
         for y in range(int(a), int(b) + 1):
-            own[y].append(i)
-    clash = {y: v for y, v in own.items() if len(v) > 1}
+            own[f"{y}{sh}"].append(i)          # 파일 이름 그대로가 열쇠다
+    clash = {k: v for k, v in own.items() if len(v) > 1}
     info["구간"] = {"구간수": len(spans), "멤버수": nmem, "잡수": nmem * len(spans),
-                    "연도별소유": {str(y): v for y, v in sorted(own.items())}}
+                    "파일별소유": {k: v for k, v in sorted(own.items())}}
     if clash:
         bad.append(f"**연도 파일 충돌** — {sorted(clash)} 를 두 구간이 같이 쓴다. "
-                   f"파일이 `{{연도}}_m{{멤버}}.jsonl.gz` 라 두 잡이 같은 파일에 append 하고 "
-                   f"git 병합이 한쪽을 버린다 (FAILURES F-200). 경계를 연말로 맞출 것")
+                   f"두 잡이 같은 `.jsonl.gz` 에 append 하고 git 병합이 한쪽을 버린다 "
+                   f"(FAILURES F-200). 구간마다 `shard:` 꼬리표를 달리 주거나 경계를 연말로 맞출 것")
 
 
 # ── D·E. 실행 상태와 커밋 신선도 ─────────────────────────────────────
